@@ -1,0 +1,100 @@
+---
+# Sync fork with upstream
+#
+# Mantém Stoltemberg/hermes-agent sincronizado com NousResearch/hermes-agent.
+# Diariamente 09:17 UTC e em pushes manuais via workflow_dispatch.
+#
+# Estratégia: reset --hard + re-aplica o commit do próprio workflow YAML.
+# Por que? GitHub Actions só roda scheduled workflows do branch default
+# (main). Logo o workflow YAML precisa estar commitado no main do fork
+# — mas main do fork deve seguir upstream de perto. Usando reset --hard +
+# cherry-pick do commit do workflow, garantimos fork/main == upstream/main
+# + exatamente 1 commit extra (workflow YAML + remoção do dependabot.yml),
+# todas as runs.
+#
+# Custo: gratuito (public repo + GITHUB_TOKEN default).
+#
+# IMPORTANTE: qualquer commit feito diretamente em fork/main QUE NÃO seja
+# o commit fork-only deste workflow será PERDIDO na próxima run. Branches
+# feat/* e local/integration (que ficam no seu clone local) não são afetadas.
+#
+# Também removemos .github/dependabot.yml no commit fork-only para impedir
+# o workflow especial "Dependabot Updates" de disparar no fork. O upstream
+# mantém o arquivo; o cherry-pick deste commit remove novamente após cada
+# reset para upstream/main.
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout fork main (full history for rev-parse)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream --quiet --tags
+
+      - name: Identify fork-only sync commit
+        id: wf_commit
+        run: |
+          # SHA do último commit que tocou .github/workflows/sync-fork-upstream.yml
+          # em fork/main. Esse commit também remove .github/dependabot.yml.
+          WF_SHA=$(git log -1 --format='%H' -- .github/workflows/sync-fork-upstream.yml main)
+          echo "Fork-only sync commit SHA: $WF_SHA"
+          echo "wf_sha=$WF_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Reset fork/main to upstream/main and re-apply fork-only sync commit
+        run: |
+          echo "=== Antes do reset (fork/main) ==="
+          git log --oneline -3 main
+
+          git reset --hard upstream/main
+
+          echo ""
+          echo "=== Após reset --hard upstream/main ==="
+          git log --oneline -3 HEAD
+
+          WF_SHA="${{ steps.wf_commit.outputs.wf_sha }}"
+          if [ -n "$WF_SHA" ]; then
+            if git cherry-pick "$WF_SHA"; then
+              echo "Cherry-pick do commit fork-only OK."
+            else
+              git cherry-pick --abort || true
+              echo "::error::cherry-pick do commit fork-only falhou; mantendo upstream/main sem push. Resolva manualmente no fork."
+              exit 1
+            fi
+          fi
+
+          echo ""
+          echo "=== Estado final (upstream/main + sync workflow, sem dependabot.yml) ==="
+          git log --oneline -5 HEAD
+          test -f .github/workflows/sync-fork-upstream.yml
+          test ! -f .github/dependabot.yml
+          echo ""
+          echo "Divergência final (fork vs upstream):"
+          git rev-list --left-right --count HEAD...upstream/main | sed 's/^/  /'
+
+      - name: Force-push to fork/main
+        run: |
+          git push origin main --force-with-lease --quiet
+          echo "Push OK. fork/main alinhado com upstream + commit fork-only:"
+          git log --oneline -3
